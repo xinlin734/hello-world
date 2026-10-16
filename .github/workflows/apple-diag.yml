@@ -1,0 +1,25 @@
+# Temporary: one-off probe of Apple's pickup endpoints from a GitHub runner.
+name: Apple endpoint probe
+on:
+  push:
+    branches: [claude/duo-actions]
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Probe with curl over HTTP/2 + cookies
+        run: |
+          UA="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
+          c() { curl -sS --http2 --compressed -A "$UA" -c jar -b jar -H "Accept-Language: en-US,en;q=0.9" "$@" || true; }
+          c -o /dev/null -w "home  %{http_code} HTTP/%{http_version}\n" https://www.apple.com/
+          c -o /dev/null -w "bag   %{http_code}\n" https://www.apple.com/shop/bag
+          echo "cookies: $(grep -vc '^#' jar || true)"
+          for ep in retail/pickup-message fulfillment-messages; do
+            c -H "Accept: application/json, text/javascript, */*; q=0.01" -H "X-Requested-With: XMLHttpRequest" \
+              -H "Referer: https://www.apple.com/shop/buy-iphone/iphone-duo" -o out.txt \
+              -w "$ep %{http_code} %{content_type}\n" \
+              "https://www.apple.com/shop/$ep?pl=true&mts.0=regular&parts.0=MK1Q4LL%2FA&searchNearby=true&location=91016"
+            head -c 800 out.txt; echo; echo
+            sleep 3
+          done
