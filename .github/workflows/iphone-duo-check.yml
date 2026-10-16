@@ -4,6 +4,11 @@ on:
   schedule:
     - cron: "*/5 * * * *"
   workflow_dispatch:
+    inputs:
+      test_alert:
+        description: "发一条测试提醒（确认手机能收到通知）"
+        type: boolean
+        default: false
   push:
     paths:
       - iphone_duo_checker.py
@@ -36,9 +41,19 @@ jobs:
           code=$?
           echo "code=$code" >> "$GITHUB_OUTPUT"
           if [ "$code" -eq 2 ]; then
-            echo "::warning::查询失败（Apple 限流或页面变了），下次再试"
+            echo "::warning::这次被 Apple 拦截或查询失败（不代表没货），下次再试"
           fi
           exit 0
+
+      - name: Test alert
+        if: github.event_name == 'workflow_dispatch' && inputs.test_alert
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          url=$(gh issue create --title "【测试】iPhone Duo 提醒测试" \
+                --body "@$OWNER 这是一条测试提醒。能收到这条通知，有货时也能收到。这个 issue 会自动关闭。")
+          gh issue close "$url"
 
       # One open issue while stock exists: created on first sighting, commented
       # when the in-stock list changes, closed when everything is gone.
