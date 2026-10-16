@@ -27,6 +27,10 @@ from dataclasses import dataclass
 from datetime import datetime
 
 BUY_URL = "https://www.apple.com/shop/buy-iphone/iphone-duo"
+BAG_URL = "https://www.apple.com/shop/bag"
+# Current pickup endpoint; the legacy one is only a fallback since Apple now
+# often answers it with HTTP 541 or an empty store list.
+PICKUP_URL = "https://www.apple.com/shop/retail/pickup-message"
 FULFILLMENT_URL = "https://www.apple.com/shop/fulfillment-messages"
 
 # Seed list; the full list is scraped from BUY_URL at startup.
@@ -57,8 +61,15 @@ USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
 )
-RETRY_STATUSES = {429, 500, 502, 503, 504, 541}
+RETRY_STATUSES = {500, 502, 503, 504}
+# Apple's refusals. Retrying them right away only extends the block.
+BLOCKED_STATUSES = {403, 429, 541}
 MIN_WATCH_SECONDS = 30
+BLOCKED_COOLDOWN_SECONDS = 300
+
+
+class Blocked(Exception):
+    """Apple refused the request; this says nothing about stock."""
 
 
 @dataclass
@@ -81,14 +92,15 @@ class Row:
 class AppleClient:
     def __init__(self, timeout=20):
         self.timeout = timeout
-        jar = http.cookiejar.CookieJar()
-        self.opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+        self.jar = http.cookiejar.CookieJar()
+        self.opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(self.jar))
 
-    def get(self, url, accept="*/*", referer=None, retries=3):
+    def get(self, url, accept="*/*", referer=None, retries=3, extra_headers=None):
         headers = {
             "User-Agent": USER_AGENT,
             "Accept": accept,
             "Accept-Language": "en-US,en;q=0.9",
+            **(extra_headers or {}),
         }
         if referer:
             headers["Referer"] = referer
@@ -98,6 +110,8 @@ class AppleClient:
                 with self.opener.open(req, timeout=self.timeout) as resp:
                     return resp.read().decode("utf-8", "replace")
             except urllib.error.HTTPError as e:
+                if e.code in BLOCKED_STATUSES:
+                    raise Blocked(f"HTTP {e.code}") from e
                 if e.code not in RETRY_STATUSES or attempt == retries - 1:
                     raise
             except (urllib.error.URLError, TimeoutError):
@@ -106,8 +120,23 @@ class AppleClient:
             time.sleep(3 * 2**attempt + random.random() * 2)
         raise RuntimeError("unreachable")
 
+    def warm_up(self):
+        """Apple's edge rejects pickup queries that carry no store cookies."""
+        if len(self.jar):
+            return
+        try:
+            self.get(BAG_URL, accept="text/html,application/xhtml+xml,*/*;q=0.8")
+        except (Blocked, urllib.error.URLError, TimeoutError):
+            pass  # The query itself decides; a failed warm-up is not an answer.
+
     def get_json(self, url, referer=None):
-        return json.loads(self.get(url, accept="application/json", referer=referer))
+        text = self.get(url, accept="application/json, text/javascript, */*; q=0.01", referer=referer,
+                        extra_headers={"X-Requested-With": "XMLHttpRequest"})
+        try:
+            return json.loads(text)
+        except ValueError:
+            # Blocks sometimes come back as a 200 HTML page.
+            raise Blocked("返回的不是 JSON") from None
 
 
 # ---------- part number discovery ----------
@@ -195,29 +224,31 @@ def parts_from_page(html):
     return found
 
 
+def _discovery_pages():
+    yield BUY_URL
+    # Each variant page carries the whole lineup; only needed if BUY_URL yields nothing.
+    for carrier in VARIANT_CARRIERS:
+        for capacity in VARIANT_CAPACITIES:
+            for color in VARIANT_COLORS:
+                yield f"{BUY_URL}/7.6-inch-display-{capacity}-{color}-{carrier}"
+
+
 def discover_parts(client, verbose=True):
     parts = {}
-    try:
-        parts.update(parts_from_page(client.get(BUY_URL, accept="text/html")))
-    except (urllib.error.URLError, TimeoutError) as e:
-        print(f"⚠️  打开 {BUY_URL} 失败：{e}", file=sys.stderr)
-
-    if not parts:
-        # Each variant page carries the whole lineup, so stop at the first hit.
-        for carrier in VARIANT_CARRIERS:
-            for capacity in VARIANT_CAPACITIES:
-                for color in VARIANT_COLORS:
-                    url = f"{BUY_URL}/7.6-inch-display-{capacity}-{color}-{carrier}"
-                    try:
-                        parts.update(parts_from_page(client.get(url, accept="text/html")))
-                    except (urllib.error.URLError, TimeoutError):
-                        continue
-                    if parts:
-                        break
-                if parts:
-                    break
-            if parts:
-                break
+    for url in _discovery_pages():
+        try:
+            parts.update(parts_from_page(client.get(url, accept="text/html")))
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                continue
+            print(f"⚠️  打开 {url} 失败：{e}", file=sys.stderr)
+            break
+        except (Blocked, urllib.error.URLError, TimeoutError) as e:
+            # Blocked or network trouble: don't hammer the remaining pages.
+            print(f"⚠️  打开 {url} 失败：{e}", file=sys.stderr)
+            break
+        if parts:
+            break
 
     for part, meta in KNOWN_PARTS.items():
         merged = dict(parts.get(part) or {})
@@ -244,8 +275,13 @@ def _plain(text):
 
 
 def parse_pickup(data):
-    """Turn a fulfillment-messages response into Rows; also return Apple's notice, if any."""
-    pickup = (((data or {}).get("body") or {}).get("content") or {}).get("pickupMessage") or {}
+    """Turn a pickup response into Rows; also return Apple's notice, if any.
+
+    retail/pickup-message puts stores at body.stores; fulfillment-messages
+    nests them under body.content.pickupMessage.
+    """
+    body = (data or {}).get("body") or {}
+    pickup = (body.get("content") or {}).get("pickupMessage") or body
     rows = []
     for store in pickup.get("stores") or []:
         for part, info in (store.get("partsAvailability") or {}).items():
@@ -266,30 +302,51 @@ def parse_pickup(data):
     return rows, notice
 
 
-def fulfillment_url(parts, zip_code):
-    params = [("fae", "true"), ("pl", "true"), ("mts.0", "regular"), ("mts.1", "compact")]
+def pickup_url(base, parts, zip_code):
+    params = [("pl", "true"), ("mts.0", "regular")]
+    if base == FULFILLMENT_URL:
+        params = [("fae", "true")] + params + [("mts.1", "compact")]
     params += [(f"parts.{i}", part) for i, part in enumerate(parts)]
     params += [("searchNearby", "true"), ("location", zip_code)]
-    return f"{FULFILLMENT_URL}?{urllib.parse.urlencode(params)}"
+    return f"{base}?{urllib.parse.urlencode(params)}"
+
+
+def query_pickup(client, parts, zip_code):
+    """Ask the current endpoint, falling back to the legacy one if it fails or finds no stores."""
+    result, error = None, None
+    for base in (PICKUP_URL, FULFILLMENT_URL):
+        try:
+            result = parse_pickup(client.get_json(pickup_url(base, parts, zip_code), referer=BUY_URL))
+        except (Blocked, urllib.error.HTTPError) as e:
+            error = error or e
+            continue
+        if result[0]:
+            return result
+    if result is not None:
+        return result
+    raise error
 
 
 def check_once(client, parts, zip_code, batch_size=8, max_miles=None):
+    """Raises Blocked if Apple refuses the queries; that is not the same as no stock."""
+    client.warm_up()
     part_list = sorted(parts)
-    rows, notices = [], set()
+    rows, notices, failed = [], set(), []
     for i in range(0, len(part_list), batch_size):
         batch = part_list[i:i + batch_size]
         try:
-            batch_rows, notice = parse_pickup(client.get_json(fulfillment_url(batch, zip_code), referer=BUY_URL))
-        except (urllib.error.HTTPError, ValueError):
+            batch_rows, notice = query_pickup(client, batch, zip_code)
+        except urllib.error.HTTPError:
             if len(batch) == 1:
                 raise
-            # Apple sometimes rejects multi-part queries; fall back to one at a time.
+            # A multi-part query was rejected outright; try one part at a time.
             batch_rows, notice = [], ""
             for part in batch:
                 try:
-                    r, n = parse_pickup(client.get_json(fulfillment_url([part], zip_code), referer=BUY_URL))
-                except (urllib.error.HTTPError, ValueError) as e:
+                    r, n = query_pickup(client, [part], zip_code)
+                except urllib.error.HTTPError as e:
                     print(f"⚠️  {part} 查询失败，跳过：{e}", file=sys.stderr)
+                    failed.append(e)
                     continue
                 batch_rows += r
                 notice = notice or n
@@ -298,6 +355,8 @@ def check_once(client, parts, zip_code, batch_size=8, max_miles=None):
             notices.add(notice)
         time.sleep(0.5 + random.random())
 
+    if failed and not rows:
+        raise failed[-1]
     rows = [r for r in rows if not r.title or "duo" in r.title.lower()]
     if max_miles is not None:
         rows = [r for r in rows if r.distance is None or r.distance <= max_miles]
@@ -387,6 +446,7 @@ def parse_args(argv=None):
     p.add_argument("--ntfy", metavar="TOPIC", help="有货时推送到 ntfy.sh/TOPIC（手机装 ntfy App 订阅即可）")
     p.add_argument("--all", action="store_true", help="显示每家店每个型号的状态（包括没货的）")
     p.add_argument("--list-parts", action="store_true", help="只列出找到的型号，不查库存")
+    p.add_argument("--hits-file", metavar="PATH", help="查一次时把有货的结果写进这个文件（给 GitHub Actions 用）")
     p.add_argument("--batch-size", type=int, default=8, help=argparse.SUPPRESS)
     return p.parse_args(argv)
 
@@ -423,16 +483,26 @@ def main(argv=None):
     if not args.watch:
         try:
             rows, notices = check_once(client, parts, args.zip, args.batch_size, args.max_miles)
-        except (urllib.error.URLError, TimeoutError, ValueError) as e:
+        except Blocked as e:
+            print(f"被 Apple 拦截了（{e}）：这不代表没货。过 10 分钟以上再试，或换个网络。", file=sys.stderr)
+            return 2
+        except (urllib.error.URLError, TimeoutError) as e:
             print(f"查询失败：{e}", file=sys.stderr)
             return 2
-        return 0 if print_report(rows, notices, parts, args.zip, args.all) else 1
+        hits = print_report(rows, notices, parts, args.zip, args.all)
+        if args.hits_file:
+            with open(args.hits_file, "w", encoding="utf-8") as f:
+                for r in hits:
+                    f.write(f"- {_store_line(r)}：{label(r.part, parts, r.title)}（{r.part}）{r.quote}\n")
+        return 0 if hits else 1
 
     interval = max(args.watch, MIN_WATCH_SECONDS)
     print(f"开始监控 {args.zip} 附近，每 {interval} 秒左右查一次，Ctrl+C 退出。")
     seen = set()
+    cooldown = 0
     try:
         while True:
+            pause = interval
             try:
                 rows, notices = check_once(client, parts, args.zip, args.batch_size, args.max_miles)
                 hits = print_report(rows, notices, parts, args.zip, args.all)
@@ -441,9 +511,16 @@ def main(argv=None):
                 if new:
                     notify(new, parts, args.ntfy)
                 seen = current
-            except (urllib.error.URLError, TimeoutError, ValueError) as e:
+                cooldown = 0
+            except Blocked as e:
+                # Back off 5 → 10 → 20 → 30 min while Apple keeps refusing.
+                cooldown = min(cooldown * 2 or BLOCKED_COOLDOWN_SECONDS, 1800)
+                pause = max(interval, cooldown)
+                print(f"[{datetime.now():%H:%M:%S}] 被 Apple 拦截（{e}），不代表没货；"
+                      f"{pause // 60} 分钟后再试", file=sys.stderr)
+            except (urllib.error.URLError, TimeoutError) as e:
                 print(f"[{datetime.now():%H:%M:%S}] 查询失败：{e}（下次继续）", file=sys.stderr)
-            time.sleep(interval + random.uniform(0, interval * 0.2))
+            time.sleep(pause + random.uniform(0, pause * 0.2))
     except KeyboardInterrupt:
         print("\n已停止。")
         return 0

@@ -1,0 +1,85 @@
+name: iPhone Duo pickup check
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+    inputs:
+      test_alert:
+        description: "发一条测试提醒（确认手机能收到通知）"
+        type: boolean
+        default: false
+  push:
+    paths:
+      - iphone_duo_checker.py
+      - .github/workflows/iphone-duo-check.yml
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: iphone-duo-check
+  cancel-in-progress: false
+
+env:
+  ZIP: "91016"
+  ISSUE_TITLE: "iPhone Duo 有货可自提（91016 附近）"
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Check Apple Store pickup
+        id: check
+        run: |
+          set +e
+          python3 iphone_duo_checker.py --zip "$ZIP" --all --hits-file hits.txt
+          code=$?
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          if [ "$code" -eq 2 ]; then
+            echo "::warning::这次被 Apple 拦截或查询失败（不代表没货），下次再试"
+          fi
+          exit 0
+
+      - name: Test alert
+        if: github.event_name == 'workflow_dispatch' && inputs.test_alert
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          url=$(gh issue create --title "【测试】iPhone Duo 提醒测试" \
+                --body "@$OWNER 这是一条测试提醒。能收到这条通知，有货时也能收到。这个 issue 会自动关闭。")
+          gh issue close "$url"
+
+      # One open issue while stock exists: created on first sighting, commented
+      # when the in-stock list changes, closed when everything is gone.
+      - name: Notify via issue
+        if: steps.check.outputs.code != '2'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CODE: ${{ steps.check.outputs.code }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          num=$(gh issue list --state open --limit 100 --json number,title \
+                --jq 'map(select(.title == env.ISSUE_TITLE)) | .[0].number // empty')
+
+          if [ "$CODE" = "0" ]; then
+            sig=$(sha256sum hits.txt | cut -c1-12)
+            body="$(printf '@%s %s 附近有 iPhone Duo 可以自提了！\n\n%s\n\n下单：https://www.apple.com/shop/buy-iphone/iphone-duo\n\n<!-- sig:%s -->' \
+                    "$OWNER" "$ZIP" "$(cat hits.txt)" "$sig")"
+            if [ -z "$num" ]; then
+              gh issue create --title "$ISSUE_TITLE" --body "$body"
+            else
+              last=$(gh issue view "$num" --json body,comments --jq '([.body] + [.comments[].body]) | last')
+              case "$last" in
+                *"sig:$sig"*) echo "库存没变化，不重复提醒" ;;
+                *) gh issue comment "$num" --body "$body" ;;
+              esac
+            fi
+          elif [ -n "$num" ]; then
+            gh issue close "$num" --comment "暂时都没货了。下次有货会再开一个新的提醒。"
+          fi

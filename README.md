@@ -16,12 +16,23 @@ python3 iphone_duo_checker.py --max-miles 20       # 只看 20 英里以内
 python3 iphone_duo_checker.py --list-parts         # 看抓到了哪些型号
 ```
 
-查一次时，有货返回 0，没货返回 1，出错返回 2，方便放进 cron。
+查一次时，有货返回 0，没货返回 1，出错或被 Apple 拦截返回 2，方便放进 cron。
+
+### 不用电脑：GitHub Actions 自动查
+
+`.github/workflows/iphone-duo-check.yml` 每 5 分钟左右查一次 91016 附近的门店（GitHub 的定时任务高峰期会晚几分钟）：
+
+- 一有货，就开一个标题为「iPhone Duo 有货可自提（91016 附近）」的 issue 并 @ 仓库主人，手机上的 GitHub App 或邮箱会收到通知。
+- 有货的门店或型号变了，在这个 issue 下追加评论；全部没货时自动关闭这个 issue，下次有货再开新的。
+- 想确认手机能不能收到通知：在 GitHub 上打开 Actions → iPhone Duo pickup check → Run workflow，勾选「发一条测试提醒」。
+- 不想查了：Actions → iPhone Duo pickup check → 右上角 `…` → Disable workflow。
+- 每次运行的完整结果（每家店每个型号的状态）都在 Actions 的运行日志里。
 
 说明：
 
 - 型号列表是启动时从 apple.com 的 iPhone Duo 购买页抓的。要是 Apple 改了页面导致抓不到，可以用 `--parts MK1Q4LL/A,...` 手动指定（MK1Q4LL/A = 2TB 星光白 无锁版）。
-- 用的是 apple.com 网页“查看门店库存”背后那个没公开的接口，Apple 随时可能改。别查得太频繁，`--watch` 最短 30 秒。
-- 据报道，Apple 官网的自提预约要 10/24（周六）才开放，在那之前查到的大概都是没货。
+- 查库存用的是 apple.com 网页“查看门店库存”背后的接口 `/shop/retail/pickup-message`。这个接口没公开，Apple 随时可能改。老接口 `/shop/fulfillment-messages` 现在会返回 HTTP 541，只留作备用。
+- HTTP 541、403、429 都是 Apple 拒绝了这次请求，**不代表没货**。脚本会报错，不会把它当成没货；`--watch` 模式下会自动等 5 到 30 分钟再试。别查得太频繁，`--watch` 最短 30 秒。
+- Apple 官网写着自提要 10/24（周六）才开放，在那之前每家店都会显示 “Check back for availability on 10.24”。
 
 运行测试：`python3 -m unittest test_iphone_duo_checker`
