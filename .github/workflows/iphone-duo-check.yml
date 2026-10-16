@@ -1,9 +1,11 @@
 name: iPhone Duo pickup check
 
-# Each watch run checks once a minute for WATCH_MINUTES, then starts the next
-# run itself, so checks continue back to back. The 5-minute schedule is only a
-# watchdog: it restarts the chain if it stopped (e.g. Apple blocked a runner)
-# and otherwise exits right away.
+# While Apple has pickup switched off ("Check back for availability on ..."),
+# the 5-minute schedule does one check per run. Once pickup opens, a run keeps
+# checking once a minute for WATCH_MINUTES and then starts the next run itself,
+# so checks continue back to back; the schedule then only restarts that chain
+# if it stopped (e.g. Apple blocked a runner). Delivery dates are checked every
+# 5 minutes either way.
 on:
   schedule:
     - cron: "*/5 * * * *"
@@ -22,6 +24,7 @@ on:
       - iphone_duo_checker.py
       - .github/workflows/iphone-duo-check.yml
       - .github/scripts/notify-issue.sh
+      - .github/scripts/notify_delivery.py
 
 permissions:
   actions: write
@@ -31,6 +34,7 @@ permissions:
 env:
   ZIP: "91016"
   ISSUE_TITLE: "iPhone Duo 有货可自提（91016 附近）"
+  DELIVERY_ISSUE_TITLE: "iPhone Duo 寄送日期（送到 91016）"
   WATCH_MINUTES: "20"
   GH_REPO: ${{ github.repository }}
 
@@ -67,7 +71,7 @@ jobs:
           echo "busy=$([ "$others" -gt 0 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
           [ "$others" -gt 0 ] && echo "已有 $others 个检查在运行，这次跳过" || true
 
-      - name: Check Apple Store pickup every minute
+      - name: Check pickup (every minute once open) and delivery dates
         id: watch
         if: steps.gate.outputs.busy != 'true'
         env:
@@ -77,17 +81,22 @@ jobs:
           # A push only smoke-tests one round.
           duration=$([ "$GITHUB_EVENT_NAME" = "push" ] && echo 0 || echo $((WATCH_MINUTES * 60)))
           set +e
-          python3 iphone_duo_checker.py --zip "$ZIP" --watch 60 --duration "$duration" --stop-on-block \
-            --hits-file hits.txt --on-change "bash .github/scripts/notify-issue.sh hits.txt"
+          python3 iphone_duo_checker.py --zip "$ZIP" --watch 60 --duration "$duration" \
+            --stop-on-block --stop-if-closed \
+            --hits-file hits.txt --on-change "bash .github/scripts/notify-issue.sh hits.txt" \
+            --delivery --delivery-file delivery.json \
+            --on-delivery-change "python3 .github/scripts/notify_delivery.py delivery.json"
           code=$?
           echo "code=$code" >> "$GITHUB_OUTPUT"
-          if [ "$code" -ne 0 ]; then
-            echo "::warning::被 Apple 拦截或查询失败（不代表没货），由定时任务稍后重启"
-          fi
+          case "$code" in
+            0) ;;
+            3) echo "自提还没开放：这次只查一轮，5 分钟后定时任务再查" ;;
+            *) echo "::warning::被 Apple 拦截或查询失败（不代表没货），由定时任务稍后重启" ;;
+          esac
           exit 0
 
-      # Hand over to a fresh run (and a fresh runner IP). After a block, leave
-      # the restart to the schedule instead of hammering Apple right away.
+      # Hand over to a fresh run (and a fresh runner IP). While pickup is closed
+      # or after a block, leave the next check to the schedule instead.
       - name: Start the next run
         if: >-
           !cancelled() && github.event_name != 'push'
