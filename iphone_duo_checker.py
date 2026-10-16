@@ -387,6 +387,7 @@ def parse_args(argv=None):
     p.add_argument("--ntfy", metavar="TOPIC", help="有货时推送到 ntfy.sh/TOPIC（手机装 ntfy App 订阅即可）")
     p.add_argument("--all", action="store_true", help="显示每家店每个型号的状态（包括没货的）")
     p.add_argument("--list-parts", action="store_true", help="只列出找到的型号，不查库存")
+    p.add_argument("--hits-file", metavar="PATH", help="查一次时把有货的结果写进这个文件（给 GitHub Actions 用）")
     p.add_argument("--batch-size", type=int, default=8, help=argparse.SUPPRESS)
     return p.parse_args(argv)
 
@@ -426,7 +427,12 @@ def main(argv=None):
         except (urllib.error.URLError, TimeoutError, ValueError) as e:
             print(f"查询失败：{e}", file=sys.stderr)
             return 2
-        return 0 if print_report(rows, notices, parts, args.zip, args.all) else 1
+        hits = print_report(rows, notices, parts, args.zip, args.all)
+        if args.hits_file:
+            with open(args.hits_file, "w", encoding="utf-8") as f:
+                for r in hits:
+                    f.write(f"- {_store_line(r)}：{label(r.part, parts, r.title)}（{r.part}）{r.quote}\n")
+        return 0 if hits else 1
 
     interval = max(args.watch, MIN_WATCH_SECONDS)
     print(f"开始监控 {args.zip} 附近，每 {interval} 秒左右查一次，Ctrl+C 退出。")

@@ -1,6 +1,7 @@
 import contextlib
 import io
-import json
+import os
+import tempfile
 import unittest
 from unittest import mock
 
@@ -133,6 +134,17 @@ class CliTest(unittest.TestCase):
             code = checker.main(["--parts", "MK1Q4LL/A", "--list-parts"])
         self.assertEqual(code, 0)
         self.assertIn("MK1Q4LL/A  iPhone Duo 2TB Star White · Unlocked", out.getvalue())
+
+    def test_hits_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "hits.txt")
+            with mock.patch.object(checker, "AppleClient", lambda: FakeClient(RESPONSE)), \
+                    mock.patch.object(checker.time, "sleep"), contextlib.redirect_stdout(io.StringIO()):
+                code = checker.main(["--parts", "MK1Q4LL/A", "--hits-file", path])
+            with open(path, encoding="utf-8") as f:
+                hits = f.read()
+        self.assertEqual(code, 0)
+        self.assertEqual(hits, "- Pasadena (Pasadena, CA · 3.2 mi)：iPhone Duo 2TB Star White · Unlocked（MK1Q4LL/A）Available Today\n")
 
 
 if __name__ == "__main__":
