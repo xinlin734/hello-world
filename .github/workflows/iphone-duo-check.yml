@@ -1,5 +1,9 @@
 name: iPhone Duo pickup check
 
+# Each watch run checks once a minute for WATCH_MINUTES, then starts the next
+# run itself, so checks continue back to back. The 5-minute schedule is only a
+# watchdog: it restarts the chain if it stopped (e.g. Apple blocked a runner)
+# and otherwise exits right away.
 on:
   schedule:
     - cron: "*/5 * * * *"
@@ -9,41 +13,33 @@ on:
         description: "发一条测试提醒（确认手机能收到通知）"
         type: boolean
         default: false
+      chained:
+        description: "内部用：由上一轮自动启动"
+        type: boolean
+        default: false
   push:
     paths:
       - iphone_duo_checker.py
       - .github/workflows/iphone-duo-check.yml
+      - .github/scripts/notify-issue.sh
 
 permissions:
+  actions: write
   contents: read
   issues: write
-
-concurrency:
-  group: iphone-duo-check
-  cancel-in-progress: false
 
 env:
   ZIP: "91016"
   ISSUE_TITLE: "iPhone Duo 有货可自提（91016 附近）"
+  WATCH_MINUTES: "20"
+  GH_REPO: ${{ github.repository }}
 
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
-
-      - name: Check Apple Store pickup
-        id: check
-        run: |
-          set +e
-          python3 iphone_duo_checker.py --zip "$ZIP" --all --hits-file hits.txt
-          code=$?
-          echo "code=$code" >> "$GITHUB_OUTPUT"
-          if [ "$code" -eq 2 ]; then
-            echo "::warning::这次被 Apple 拦截或查询失败（不代表没货），下次再试"
-          fi
-          exit 0
 
       - name: Test alert
         if: github.event_name == 'workflow_dispatch' && inputs.test_alert
@@ -55,31 +51,47 @@ jobs:
                 --body "@$OWNER 这是一条测试提醒。能收到这条通知，有货时也能收到。这个 issue 会自动关闭。")
           gh issue close "$url"
 
-      # One open issue while stock exists: created on first sighting, commented
-      # when the in-stock list changes, closed when everything is gone.
-      - name: Notify via issue
-        if: steps.check.outputs.code != '2'
+      # Chained runs always proceed. Anything else steps aside while another
+      # run is active, so only one watcher queries Apple at a time.
+      - name: Skip if another watcher is running
+        id: gate
         env:
           GH_TOKEN: ${{ github.token }}
-          CODE: ${{ steps.check.outputs.code }}
+          CHAINED: ${{ github.event_name == 'workflow_dispatch' && inputs.chained }}
+        run: |
+          if [ "$CHAINED" = "true" ] || [ "$GITHUB_EVENT_NAME" = "push" ]; then
+            echo "busy=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          others=$(gh run list --workflow iphone-duo-check.yml --limit 30 --json databaseId,status,event \
+            --jq "[.[] | select(.databaseId != $GITHUB_RUN_ID and .event != \"push\" and .status != \"completed\")] | length")
+          echo "busy=$([ "$others" -gt 0 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          [ "$others" -gt 0 ] && echo "已有 $others 个检查在运行，这次跳过" || true
+
+      - name: Check Apple Store pickup every minute
+        id: watch
+        if: steps.gate.outputs.busy != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
           OWNER: ${{ github.repository_owner }}
         run: |
-          num=$(gh issue list --state open --limit 100 --json number,title \
-                --jq 'map(select(.title == env.ISSUE_TITLE)) | .[0].number // empty')
-
-          if [ "$CODE" = "0" ]; then
-            sig=$(sha256sum hits.txt | cut -c1-12)
-            body="$(printf '@%s %s 附近有 iPhone Duo 可以自提了！\n\n%s\n\n下单：https://www.apple.com/shop/buy-iphone/iphone-duo\n\n<!-- sig:%s -->' \
-                    "$OWNER" "$ZIP" "$(cat hits.txt)" "$sig")"
-            if [ -z "$num" ]; then
-              gh issue create --title "$ISSUE_TITLE" --body "$body"
-            else
-              last=$(gh issue view "$num" --json body,comments --jq '([.body] + [.comments[].body]) | last')
-              case "$last" in
-                *"sig:$sig"*) echo "库存没变化，不重复提醒" ;;
-                *) gh issue comment "$num" --body "$body" ;;
-              esac
-            fi
-          elif [ -n "$num" ]; then
-            gh issue close "$num" --comment "暂时都没货了。下次有货会再开一个新的提醒。"
+          # A push only smoke-tests one round.
+          duration=$([ "$GITHUB_EVENT_NAME" = "push" ] && echo 0 || echo $((WATCH_MINUTES * 60)))
+          set +e
+          python3 iphone_duo_checker.py --zip "$ZIP" --watch 60 --duration "$duration" --stop-on-block \
+            --hits-file hits.txt --on-change "bash .github/scripts/notify-issue.sh hits.txt"
+          code=$?
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          if [ "$code" -ne 0 ]; then
+            echo "::warning::被 Apple 拦截或查询失败（不代表没货），由定时任务稍后重启"
           fi
+          exit 0
+
+      # Hand over to a fresh run (and a fresh runner IP). After a block, leave
+      # the restart to the schedule instead of hammering Apple right away.
+      - name: Start the next run
+        if: >-
+          !cancelled() && github.event_name != 'push'
+          && steps.gate.outputs.busy != 'true' && steps.watch.outputs.code == '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run iphone-duo-check.yml --ref "$GITHUB_REF_NAME" -f chained=true

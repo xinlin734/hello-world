@@ -176,6 +176,55 @@ class PickupTest(unittest.TestCase):
             checker.check_once(client, {"MK1Q4LL/A": {}, "MAAA1LL/A": {}}, "91016")
 
 
+class WatchTest(unittest.TestCase):
+    """--watch with a fake clock: every sleep advances time by its own length."""
+
+    def run_watch(self, responses, argv):
+        clock = [0.0]
+        responses = iter(responses)
+
+        class Client(FakeClient):
+            def get_json(self, url, referer=None):
+                result = next(responses)
+                if isinstance(result, Exception):
+                    raise result
+                return result
+
+        def sleep(seconds):
+            clock[0] += seconds
+
+        with mock.patch.object(checker, "AppleClient", lambda: Client()), \
+                mock.patch.object(checker.time, "sleep", sleep), \
+                mock.patch.object(checker.time, "monotonic", lambda: clock[0]), \
+                mock.patch.object(checker.subprocess, "run") as run, \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            code = checker.main(["--parts", "MK1Q4LL/A"] + argv)
+        return code, run, clock[0]
+
+    def test_on_change_fires_first_round_and_on_changes_only(self):
+        empty = {"body": {"stores": [store("Pasadena", "R034", 12.1, {"MK1Q4LL/A": ("default", "iPhone Duo 2TB Star White")})]}}
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "hits.txt")
+            code, run, elapsed = self.run_watch(
+                [empty, empty, RESPONSE, RESPONSE, empty],
+                ["--watch", "60", "--duration", "290", "--hits-file", path, "--on-change", "notify"])
+            with open(path, encoding="utf-8") as f:
+                last_hits = f.read()
+        self.assertEqual(code, 0)
+        # Rounds: empty (first) → empty → stock → stock → empty: fires on 1st, 3rd and 5th.
+        self.assertEqual(run.call_count, 3)
+        self.assertEqual(run.call_args.args, ("notify",))
+        self.assertEqual(last_hits, "")
+        self.assertLess(elapsed, 290)
+
+    def test_stop_on_block(self):
+        code, run, _ = self.run_watch(
+            [checker.Blocked("HTTP 541"), checker.Blocked("HTTP 541")],
+            ["--watch", "60", "--duration", "600", "--stop-on-block", "--on-change", "notify"])
+        self.assertEqual(code, 2)
+        run.assert_not_called()
+
+
 class ClientTest(unittest.TestCase):
     def test_541_raises_blocked_without_retry(self):
         client = checker.AppleClient()

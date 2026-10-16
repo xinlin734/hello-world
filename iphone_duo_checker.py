@@ -446,7 +446,12 @@ def parse_args(argv=None):
     p.add_argument("--ntfy", metavar="TOPIC", help="有货时推送到 ntfy.sh/TOPIC（手机装 ntfy App 订阅即可）")
     p.add_argument("--all", action="store_true", help="显示每家店每个型号的状态（包括没货的）")
     p.add_argument("--list-parts", action="store_true", help="只列出找到的型号，不查库存")
-    p.add_argument("--hits-file", metavar="PATH", help="查一次时把有货的结果写进这个文件（给 GitHub Actions 用）")
+    p.add_argument("--hits-file", metavar="PATH", help="每次查完把有货的结果写进这个文件")
+    p.add_argument("--on-change", metavar="CMD",
+                   help="--watch 模式下，第一次查完以及有货的门店/型号变化时执行这条命令")
+    p.add_argument("--duration", type=int, metavar="SECONDS", help="--watch 模式下跑这么多秒后自动退出")
+    p.add_argument("--stop-on-block", action="store_true",
+                   help="--watch 模式下被 Apple 拦截就退出（返回 2），而不是原地等")
     p.add_argument("--batch-size", type=int, default=8, help=argparse.SUPPRESS)
     return p.parse_args(argv)
 
@@ -465,6 +470,12 @@ def resolve_parts(client, args):
         # Keep parts whose carrier we couldn't infer rather than silently dropping them.
         parts = {p: m for p, m in parts.items() if not m.get("carrier") or m["carrier"] in wanted}
     return parts
+
+
+def write_hits(path, hits, parts):
+    with open(path, "w", encoding="utf-8") as f:
+        for r in hits:
+            f.write(f"- {_store_line(r)}：{label(r.part, parts, r.title)}（{r.part}）{r.quote}\n")
 
 
 def main(argv=None):
@@ -491,14 +502,14 @@ def main(argv=None):
             return 2
         hits = print_report(rows, notices, parts, args.zip, args.all)
         if args.hits_file:
-            with open(args.hits_file, "w", encoding="utf-8") as f:
-                for r in hits:
-                    f.write(f"- {_store_line(r)}：{label(r.part, parts, r.title)}（{r.part}）{r.quote}\n")
+            write_hits(args.hits_file, hits, parts)
         return 0 if hits else 1
 
     interval = max(args.watch, MIN_WATCH_SECONDS)
-    print(f"开始监控 {args.zip} 附近，每 {interval} 秒左右查一次，Ctrl+C 退出。")
-    seen = set()
+    until = f"，{args.duration} 秒后退出" if args.duration is not None else "，Ctrl+C 退出"
+    print(f"开始监控 {args.zip} 附近，每 {interval} 秒左右查一次{until}。", flush=True)
+    started = time.monotonic()
+    seen = None  # None until the first successful round, so --on-change always fires once
     cooldown = 0
     try:
         while True:
@@ -506,13 +517,21 @@ def main(argv=None):
             try:
                 rows, notices = check_once(client, parts, args.zip, args.batch_size, args.max_miles)
                 hits = print_report(rows, notices, parts, args.zip, args.all)
+                sys.stdout.flush()
                 current = {(r.store_number, r.part) for r in hits}
-                new = [r for r in hits if (r.store_number, r.part) not in seen]
+                if args.hits_file:
+                    write_hits(args.hits_file, hits, parts)
+                new = [r for r in hits if (r.store_number, r.part) not in (seen or set())]
                 if new:
                     notify(new, parts, args.ntfy)
+                if args.on_change and current != seen:
+                    subprocess.run(args.on_change, shell=True, check=False)
                 seen = current
                 cooldown = 0
             except Blocked as e:
+                if args.stop_on_block:
+                    print(f"[{datetime.now():%H:%M:%S}] 被 Apple 拦截（{e}），不代表没货；退出", file=sys.stderr)
+                    return 2
                 # Back off 5 → 10 → 20 → 30 min while Apple keeps refusing.
                 cooldown = min(cooldown * 2 or BLOCKED_COOLDOWN_SECONDS, 1800)
                 pause = max(interval, cooldown)
@@ -520,7 +539,9 @@ def main(argv=None):
                       f"{pause // 60} 分钟后再试", file=sys.stderr)
             except (urllib.error.URLError, TimeoutError) as e:
                 print(f"[{datetime.now():%H:%M:%S}] 查询失败：{e}（下次继续）", file=sys.stderr)
-            time.sleep(pause + random.uniform(0, pause * 0.2))
+            if args.duration is not None and time.monotonic() - started + pause > args.duration:
+                return 0
+            time.sleep(pause + random.uniform(0, 3))
     except KeyboardInterrupt:
         print("\n已停止。")
         return 0

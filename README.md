@@ -20,12 +20,12 @@ python3 iphone_duo_checker.py --list-parts         # 看抓到了哪些型号
 
 ### 不用电脑：GitHub Actions 自动查
 
-`.github/workflows/iphone-duo-check.yml` 每 5 分钟左右查一次 91016 附近的门店（GitHub 的定时任务高峰期会晚几分钟）：
+`.github/workflows/iphone-duo-check.yml` 每分钟查一次 91016 附近的门店。每次运行连续查 20 分钟，结束前自己启动下一轮，所以中间不会断；另有一个每 5 分钟的定时任务负责看门，万一接力断了（比如某台 GitHub 机器被 Apple 拦截），它会把检查重新拉起来。
 
 - 一有货，就开一个标题为「iPhone Duo 有货可自提（91016 附近）」的 issue 并 @ 仓库主人，手机上的 GitHub App 或邮箱会收到通知。
 - 有货的门店或型号变了，在这个 issue 下追加评论；全部没货时自动关闭这个 issue，下次有货再开新的。
 - 想确认手机能不能收到通知：在 GitHub 上打开 Actions → iPhone Duo pickup check → Run workflow，勾选「发一条测试提醒」。
-- 不想查了：Actions → iPhone Duo pickup check → 右上角 `…` → Disable workflow。
+- 不想查了：Actions → iPhone Duo pickup check → 右上角 `…` → Disable workflow（只取消某一次运行没用，看门的定时任务几分钟后会重新启动）。
 - 每次运行的完整结果（每家店每个型号的状态）都在 Actions 的运行日志里。
 
 说明：
