@@ -32,6 +32,7 @@ BAG_URL = "https://www.apple.com/shop/bag"
 # often answers it with HTTP 541 or an empty store list.
 PICKUP_URL = "https://www.apple.com/shop/retail/pickup-message"
 FULFILLMENT_URL = "https://www.apple.com/shop/fulfillment-messages"
+DELIVERY_URL = "https://www.apple.com/shop/delivery-message"
 
 # Seed list; the full list is scraped from BUY_URL at startup.
 KNOWN_PARTS = {
@@ -66,6 +67,7 @@ RETRY_STATUSES = {500, 502, 503, 504}
 BLOCKED_STATUSES = {403, 429, 541}
 MIN_WATCH_SECONDS = 30
 BLOCKED_COOLDOWN_SECONDS = 300
+DELIVERY_EVERY_SECONDS = 300  # ship dates move slowly; no need to ask every minute
 
 
 class Blocked(Exception):
@@ -83,10 +85,22 @@ class Row:
     title: str
     status: str
     quote: str
+    selectable: bool = True  # storeSelectionEnabled; False while Apple has pickup switched off
 
     @property
     def available(self):
         return self.status == "available"
+
+
+def pickup_closed(rows):
+    """True when Apple has pickup switched off for every store and model.
+
+    Before launch Apple answers every store with pickupDisplay "default",
+    storeSelectionEnabled false and "Check back for availability on <date>",
+    regardless of stock. Anything else counts as open, so a misread errs
+    toward checking more often, not less.
+    """
+    return bool(rows) and all(r.status == "default" and not r.selectable for r in rows)
 
 
 class AppleClient:
@@ -297,6 +311,7 @@ def parse_pickup(data):
                 title=message.get("storePickupProductTitle") or "",
                 status=(info.get("pickupDisplay") or "").lower(),
                 quote=_plain(info.get("pickupSearchQuote") or message.get("storePickupQuote")),
+                selectable=message.get("storeSelectionEnabled") is not False,
             ))
     notice = _plain(pickup.get("errorMessage") or pickup.get("pickupLocatorErrorMessage"))
     return rows, notice
@@ -362,6 +377,72 @@ def check_once(client, parts, zip_code, batch_size=8, max_miles=None):
         rows = [r for r in rows if r.distance is None or r.distance <= max_miles]
     rows.sort(key=lambda r: (r.distance if r.distance is not None else 1e9, r.store, r.part))
     return rows, notices
+
+
+def learn_titles(parts, rows):
+    """Fill in capacity/color from Apple's product titles so labels read the same everywhere."""
+    for r in rows:
+        if r.title and r.part in parts:
+            meta = parts[r.part]
+            for key, value in infer_meta(r.title).items():
+                if value and not meta.get(key):
+                    meta[key] = value
+
+
+# ---------- delivery dates ----------
+
+def delivery_url(parts, zip_code):
+    # postalCode, not location: the latter is ignored in favour of IP geolocation.
+    params = [(f"parts.{i}", part) for i, part in enumerate(parts)]
+    params += [("mts.0", "regular"), ("postalCode", zip_code)]
+    return f"{DELIVERY_URL}?{urllib.parse.urlencode(params)}"
+
+
+def parse_delivery(data):
+    """{part: {"date": "YYYYMMDD" or None, "text": "Mon, Jan 25 — Free"}} from delivery-message."""
+    messages = (((data or {}).get("body") or {}).get("content") or {}).get("deliveryMessage") or {}
+    result = {}
+    for part, info in messages.items():
+        if not PART_RE.fullmatch(part) or not isinstance(info, dict):
+            continue
+        regular = info.get("regular") or {}
+        options = [o for o in regular.get("deliveryOptionMessages") or [] if isinstance(o, dict)]
+        dated = sorted((o for o in options if o.get("encodedUpperDateString")),
+                       key=lambda o: o["encodedUpperDateString"])
+        best = (dated or options or [{}])[0]
+        buyable = (regular.get("buyability") or {}).get("isBuyable") is not False
+        result[part] = {
+            "date": best.get("encodedUpperDateString") if buyable else None,
+            "text": _plain(best.get("displayName")) or ("" if buyable else "暂时买不了"),
+        }
+    return result
+
+
+def check_delivery(client, parts, zip_code, batch_size=8):
+    part_list = sorted(parts)
+    result = {}
+    for i in range(0, len(part_list), batch_size):
+        url = delivery_url(part_list[i:i + batch_size], zip_code)
+        result.update(parse_delivery(client.get_json(url, referer=BUY_URL)))
+    return result
+
+
+def print_delivery(delivery, parts, zip_code):
+    print(f"寄送到 {zip_code} 最早：")
+    by_text = {}
+    for part in sorted(delivery, key=lambda p: label(p, parts)):
+        by_text.setdefault(delivery[part]["text"] or "没有日期", []).append(part)
+    if len(by_text) == 1 and len(delivery) > 1:
+        print(f"   {len(delivery)} 个型号都是 {next(iter(by_text))}")
+        return
+    for part in sorted(delivery, key=lambda p: label(p, parts)):
+        print(f"   {label(part, parts):<42} {delivery[part]['text'] or '没有日期'}")
+
+
+def write_delivery(path, delivery, parts):
+    data = {part: {**d, "label": label(part, parts)} for part, d in delivery.items()}
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=1, sort_keys=True)
 
 
 # ---------- output ----------
@@ -452,6 +533,12 @@ def parse_args(argv=None):
     p.add_argument("--duration", type=int, metavar="SECONDS", help="--watch 模式下跑这么多秒后自动退出")
     p.add_argument("--stop-on-block", action="store_true",
                    help="--watch 模式下被 Apple 拦截就退出（返回 2），而不是原地等")
+    p.add_argument("--delivery", action="store_true", help="同时查寄送到这个邮编的最早日期（--watch 模式下每 5 分钟查一次）")
+    p.add_argument("--delivery-file", metavar="PATH", help="把寄送日期写进这个 JSON 文件")
+    p.add_argument("--on-delivery-change", metavar="CMD",
+                   help="--watch 模式下，第一次查到以及寄送日期变化时执行这条命令")
+    p.add_argument("--stop-if-closed", action="store_true",
+                   help="--watch 模式下如果 Apple 还没开放自提（所有门店都显示“稍后再来”），查完这一轮就退出（返回 3）")
     p.add_argument("--batch-size", type=int, default=8, help=argparse.SUPPRESS)
     return p.parse_args(argv)
 
@@ -470,6 +557,22 @@ def resolve_parts(client, args):
         # Keep parts whose carrier we couldn't infer rather than silently dropping them.
         parts = {p: m for p, m in parts.items() if not m.get("carrier") or m["carrier"] in wanted}
     return parts
+
+
+def watch_delivery(client, parts, args, previous):
+    """One delivery round inside --watch; returns what to compare the next round against."""
+    try:
+        delivery = check_delivery(client, parts, args.zip, args.batch_size)
+    except (Blocked, urllib.error.URLError, TimeoutError) as e:
+        print(f"[{datetime.now():%H:%M:%S}] 寄送日期没查到：{e}（下次再试）", file=sys.stderr)
+        return previous
+    print_delivery(delivery, parts, args.zip)
+    sys.stdout.flush()
+    if args.delivery_file:
+        write_delivery(args.delivery_file, delivery, parts)
+    if args.on_delivery_change and delivery and delivery != previous:
+        subprocess.run(args.on_delivery_change, shell=True, check=False)
+    return delivery
 
 
 def write_hits(path, hits, parts):
@@ -500,9 +603,19 @@ def main(argv=None):
         except (urllib.error.URLError, TimeoutError) as e:
             print(f"查询失败：{e}", file=sys.stderr)
             return 2
+        learn_titles(parts, rows)
         hits = print_report(rows, notices, parts, args.zip, args.all)
         if args.hits_file:
             write_hits(args.hits_file, hits, parts)
+        if args.delivery:
+            try:
+                delivery = check_delivery(client, parts, args.zip, args.batch_size)
+            except (Blocked, urllib.error.URLError, TimeoutError) as e:
+                print(f"寄送日期没查到：{e}", file=sys.stderr)
+            else:
+                print_delivery(delivery, parts, args.zip)
+                if args.delivery_file:
+                    write_delivery(args.delivery_file, delivery, parts)
         return 0 if hits else 1
 
     interval = max(args.watch, MIN_WATCH_SECONDS)
@@ -511,11 +624,13 @@ def main(argv=None):
     started = time.monotonic()
     seen = None  # None until the first successful round, so --on-change always fires once
     cooldown = 0
+    last_delivery, delivery_checked_at = None, None
     try:
         while True:
             pause = interval
             try:
                 rows, notices = check_once(client, parts, args.zip, args.batch_size, args.max_miles)
+                learn_titles(parts, rows)
                 hits = print_report(rows, notices, parts, args.zip, args.all)
                 sys.stdout.flush()
                 current = {(r.store_number, r.part) for r in hits}
@@ -528,6 +643,13 @@ def main(argv=None):
                     subprocess.run(args.on_change, shell=True, check=False)
                 seen = current
                 cooldown = 0
+                if args.delivery and (delivery_checked_at is None
+                                      or time.monotonic() - delivery_checked_at >= DELIVERY_EVERY_SECONDS):
+                    delivery_checked_at = time.monotonic()
+                    last_delivery = watch_delivery(client, parts, args, last_delivery)
+                if args.stop_if_closed and pickup_closed(rows):
+                    print(f"Apple 还没开放自提（{rows[0].quote}），先不每分钟查了。", flush=True)
+                    return 3
             except Blocked as e:
                 if args.stop_on_block:
                     print(f"[{datetime.now():%H:%M:%S}] 被 Apple 拦截（{e}），不代表没货；退出", file=sys.stderr)
